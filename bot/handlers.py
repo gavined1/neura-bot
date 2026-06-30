@@ -1,6 +1,6 @@
+import asyncio
 import logging
 import uuid
-
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ContextTypes
 
@@ -15,6 +15,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def _send_typing_loop(bot, chat_id: int) -> None:
+    try:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                logger.debug("Failed to send typing action to chat %s", chat_id)
+            await asyncio.sleep(4.5)
+    except asyncio.CancelledError:
+        pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if not update.message or not update.message.text:
@@ -24,7 +36,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         group_id = update.message.chat_id
         text = update.message.text
 
-        reply = await generate_ai_reply(user_id, group_id, text)
+        # Create background task for typing action
+        typing_task = asyncio.create_task(
+            _send_typing_loop(context.bot, group_id)
+        )
+        try:
+            reply = await generate_ai_reply(user_id, group_id, text)
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
         await update.message.reply_text(reply)
     except Exception:
         logger.exception("handle_message failed")

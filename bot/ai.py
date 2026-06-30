@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import List, Dict, Optional
 
 import httpx
@@ -48,10 +49,42 @@ _http_client: Optional[httpx.AsyncClient] = None
 
 def init_http_client() -> None:
     global _http_client
+    max_conn = max(100, config.LLM_MAX_CONCURRENT * 2)
+    max_keepalive = max(20, config.LLM_MAX_CONCURRENT)
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(config.LLM_TIMEOUT_SECONDS, connect=10.0),
-        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        limits=httpx.Limits(max_connections=max_conn, max_keepalive_connections=max_keepalive),
     )
+
+
+class ConcurrencyLimitError(Exception):
+    pass
+
+_global_sem: Optional[asyncio.Semaphore] = None
+_user_semaphores: Dict[int, int] = {}
+_user_sem_lock = asyncio.Lock()
+
+@asynccontextmanager
+async def limit_concurrency(user_id: int):
+    global _global_sem
+    if _global_sem is None:
+        _global_sem = asyncio.Semaphore(config.LLM_MAX_CONCURRENT)
+
+    async with _user_sem_lock:
+        current_active = _user_semaphores.get(user_id, 0)
+        if current_active >= config.PER_USER_MAX_CONCURRENT:
+            raise ConcurrencyLimitError("User concurrency limit exceeded")
+        _user_semaphores[user_id] = current_active + 1
+
+    try:
+        async with _global_sem:
+            yield
+    finally:
+        async with _user_sem_lock:
+            if user_id in _user_semaphores:
+                _user_semaphores[user_id] -= 1
+                if _user_semaphores[user_id] <= 0:
+                    _user_semaphores.pop(user_id, None)
 
 
 async def close_http_client() -> None:
@@ -115,20 +148,21 @@ async def _call_llm(messages: List[Dict]) -> str:
 
 
 async def generate_ai_reply(user_id: int, group_id: int, text: str) -> str:
-    history = await fetch_history(user_id, group_id)
-    messages = _build_messages(history, text)
-
     try:
-        reply = await _call_llm(messages)
+        async with limit_concurrency(user_id):
+            history = await fetch_history(user_id, group_id)
+            messages = _build_messages(history, text)
+            reply = await _call_llm(messages)
+
+            # Fire-and-forget-ish but awaited so failures are logged, not silently lost
+            await save_history(user_id, group_id, "user", text)
+            await save_history(user_id, group_id, "assistant", reply)
+            return reply
+    except ConcurrencyLimitError:
+        return "You have too many requests in progress. Please wait for them to finish."
     except Exception:
         logger.exception("LLM call failed user_id=%s group_id=%s", user_id, group_id)
         return FALLBACK_REPLY
-
-    # Fire-and-forget-ish but awaited so failures are logged, not silently lost
-    await save_history(user_id, group_id, "user", text)
-    await save_history(user_id, group_id, "assistant", reply)
-
-    return reply
 
 
 async def generate_inline_reply(user_id: int, text: str) -> str:
@@ -136,12 +170,15 @@ async def generate_inline_reply(user_id: int, text: str) -> str:
     Inline mode has no group_id available, so this path does not read/write
     group-scoped history. Kept stateless and lightweight.
     """
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": text},
-    ]
     try:
-        return await _call_llm(messages)
+        async with limit_concurrency(user_id):
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ]
+            return await _call_llm(messages)
+    except ConcurrencyLimitError:
+        return "Rate limit exceeded. Please wait."
     except Exception:
         logger.exception("Inline LLM call failed user_id=%s", user_id)
         return FALLBACK_REPLY
