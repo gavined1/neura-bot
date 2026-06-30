@@ -1,79 +1,54 @@
 import logging
-import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from telegram import Update
-from telegram.ext import Application
+from telegram.ext import Application, MessageHandler, InlineQueryHandler, CommandHandler, filters
 
-from bot.config import settings
-from bot.handlers import handlers
+from bot.config import config
+from bot.handlers import handle_message, handle_inline, start_command
 
-# Configure root logger
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("neura.main")
 
-# Build the PTB Application
-application = (
-    Application.builder()
-    .token(settings.telegram_bot_token)
-    .build()
-)
-
-# Register handlers
-for handler in handlers:
-    application.add_handler(handler)
-
-# Store bot name for handlers
-application.bot_data["bot_name"] = settings.bot_name
+telegram_app = Application.builder().token(config.BOT_TOKEN).build()
+telegram_app.add_handler(CommandHandler("start", start_command))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+telegram_app.add_handler(InlineQueryHandler(handle_inline))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: startup and shutdown."""
-    # Startup
-    logger.info("Starting bot...")
-    await application.initialize()
-    await application.bot.set_webhook(
-        url=f"{settings.webhook_url}/webhook",
-        drop_pending_updates=True,
-    )
-    logger.info("Webhook set to %s/webhook", settings.webhook_url)
+    await telegram_app.initialize()
+    webhook_url = f"{config.WEBHOOK_URL}/webhook"
+    await telegram_app.bot.set_webhook(url=webhook_url)
+    logger.info("Webhook registered at %s", webhook_url)
+    await telegram_app.start()
 
     yield
 
-    # Shutdown
-    logger.info("Shutting down bot...")
-    await application.shutdown()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+    logger.info("Telegram application shut down")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/")
-@app.get("/health")
-async def health() -> dict:
-    """Health check endpoint."""
-    return {"status": "alive"}
-
-
 @app.post("/webhook")
-async def webhook(request: Request) -> Response:
-    """Telegram webhook endpoint."""
+async def webhook(request: Request):
     try:
         data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-    except Exception as e:
-        logger.exception("Webhook error: %s", e)
-    return Response(status_code=200)
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.process_update(update)
+    except Exception:
+        logger.exception("Failed to process update")
+    return {"ok": True}
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+@app.get("/")
+async def health():
+    return {"status": "alive"}

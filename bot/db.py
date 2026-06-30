@@ -1,76 +1,53 @@
 import logging
+from typing import List, Dict
 
 from supabase import create_client, Client
 
-from .config import settings
+from bot.config import config
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("neura.db")
 
-_supabase: Client | None = None
+_client: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
 
-
-def get_supabase() -> Client:
-    """Get or create Supabase client singleton."""
-    global _supabase
-    if _supabase is None:
-        _supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
-    return _supabase
+TABLE = "conversations"
 
 
-async def fetch_history(user_id: int, group_id: int, limit: int = 10) -> list[dict[str, str]]:
+async def fetch_history(user_id: int, group_id: int, limit: int = None) -> List[Dict]:
     """
-    Fetch last N messages for a (user_id, group_id) pair.
-
-    Returns list of dicts with 'role' and 'content' keys for LLM consumption.
+    Returns the last `limit` messages for this exact (user_id, group_id) pair,
+    ordered oldest -> newest, as a list of {"role": ..., "message": ...} dicts.
     """
-    supabase = get_supabase()
+    limit = limit or config.HISTORY_LIMIT
     try:
         resp = (
-            supabase.table("conversations")
-            .select("role, message")
+            _client.table(TABLE)
+            .select("role, message, created_at")
             .eq("user_id", user_id)
             .eq("group_id", group_id)
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
-        # Supabase returns newest first; reverse for chronological order
-        messages = [{"role": row["role"], "content": row["message"]} for row in reversed(resp.data)]
-        return messages
-    except Exception as e:
-        logger.error("Failed to fetch history for user=%s group=%s: %s", user_id, group_id, e)
+        rows = resp.data or []
+        rows.reverse()  # oldest -> newest
+        return [{"role": r["role"], "message": r["message"]} for r in rows]
+    except Exception:
+        logger.exception("fetch_history failed for user_id=%s group_id=%s", user_id, group_id)
         return []
 
 
-async def save_message(user_id: int, group_id: int, role: str, message: str) -> bool:
+async def save_history(user_id: int, group_id: int, role: str, message: str) -> None:
     """
-    Save a single message to conversation history.
-
-    Returns True on success, False on failure (errors are logged, not raised).
+    Inserts a single message row. role must be 'user' or 'assistant'.
     """
-    if role not in ("user", "assistant"):
-        logger.error("Invalid role '%s' for user=%s group=%s", role, user_id, group_id)
-        return False
-
-    supabase = get_supabase()
     try:
-        supabase.table("conversations").insert({
-            "user_id": user_id,
-            "group_id": group_id,
-            "role": role,
-            "message": message,
-        }).execute()
-        return True
-    except Exception as e:
-        logger.error("Failed to save message for user=%s group=%s role=%s: %s", user_id, group_id, role, e)
-        return False
-
-
-async def save_user_message(user_id: int, group_id: int, message: str) -> bool:
-    """Convenience wrapper for saving user messages."""
-    return await save_message(user_id, group_id, "user", message)
-
-
-async def save_assistant_message(user_id: int, group_id: int, message: str) -> bool:
-    """Convenience wrapper for saving assistant messages."""
-    return await save_message(user_id, group_id, "assistant", message)
+        _client.table(TABLE).insert(
+            {
+                "user_id": user_id,
+                "group_id": group_id,
+                "role": role,
+                "message": message,
+            }
+        ).execute()
+    except Exception:
+        logger.exception("save_history failed for user_id=%s group_id=%s", user_id, group_id)

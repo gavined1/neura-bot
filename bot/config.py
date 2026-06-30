@@ -1,41 +1,19 @@
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
 
 
-class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+class Config:
+    BOT_TOKEN: str = os.environ["BOT_TOKEN"]
+    WEBHOOK_URL: str = os.environ["WEBHOOK_URL"].rstrip("/")
+    PORT: int = int(os.environ.get("PORT", 8080))
 
-    # Telegram
-    telegram_bot_token: str = Field(alias="TELEGRAM_BOT_TOKEN")
+    SUPABASE_URL: str = os.environ["SUPABASE_URL"]
+    SUPABASE_KEY: str = os.environ["SUPABASE_KEY"]
 
-    # Webhook
-    webhook_url: str = Field(alias="WEBHOOK_URL")
+    LLM_API_BASE: str = os.environ["LLM_API_BASE"].rstrip("/")
+    LLM_API_KEY: str = os.environ["LLM_API_KEY"]
+    LLM_MODEL: str = os.environ.get("LLM_MODEL", "deepseek-v4")
 
-    # Supabase
-    supabase_url: str = Field(alias="SUPABASE_URL")
-    supabase_service_role_key: str = Field(alias="SUPABASE_SERVICE_ROLE_KEY")
-
-    # LLM API
-    llm_api_url: str = Field(default="https://openrouter.ai/api/v1/chat/completions", alias="LLM_API_URL")
-    llm_api_key: str = Field(alias="LLM_API_KEY")
-    llm_model: str = Field(default="openai/gpt-4o-mini", alias="LLM_MODEL")
-
-    # Optional bot identity
-    bot_name: str = Field(default="Neura", alias="BOT_NAME")
-    bot_system_prompt: str = Field(
-        default=(
-            "You are Neura, a helpful, concise, and friendly AI assistant. "
-            "Be concise but helpful. Use markdown formatting when appropriate."
-        ),
-        alias="BOT_SYSTEM_PROMPT",
-    )
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
+    HISTORY_LIMIT: int = int(os.environ.get("HISTORY_LIMIT", 10))
 
 
-settings = Settings()
+config = Config()
