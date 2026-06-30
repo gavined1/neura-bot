@@ -36,7 +36,15 @@ async def _register_webhook() -> None:
     """Best-effort webhook registration. Failure is logged, not raised, so
     Railway's healthcheck still flips to green and we can let a later call
     (or manual retry) re-register the URL."""
-    url = f"{config.webhook_url}/webhook"
+    webhook_base = config.webhook_url
+    if not webhook_base or "${{" in webhook_base:
+        logger.warning(
+            "Webhook URL is not configured or is a placeholder (%r). Skipping webhook registration.",
+            webhook_base
+        )
+        return
+
+    url = f"{webhook_base}/webhook"
     try:
         await telegram_app.bot.set_webhook(
             url=url,

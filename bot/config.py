@@ -37,7 +37,12 @@ class Settings(BaseSettings):
 
     @property
     def webhook_url(self) -> str:
-        return self.WEBHOOK_URL.rstrip("/")
+        url = self.WEBHOOK_URL.strip().rstrip("/")
+        if not url:
+            return ""
+        if not (url.startswith("http://") or url.startswith("https://")):
+            url = "https://" + url
+        return url
 
     @property
     def llm_api_base(self) -> str:
