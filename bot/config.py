@@ -1,19 +1,42 @@
-import os
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 
-class Config:
-    BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-    WEBHOOK_URL: str = os.environ["WEBHOOK_URL"].rstrip("/")
-    PORT: int = int(os.environ.get("PORT", 8080))
+class Settings(BaseSettings):
+    BOT_TOKEN: str
+    WEBHOOK_URL: str
+    WEBHOOK_SECRET: str = Field(min_length=8, max_length=256)
 
-    SUPABASE_URL: str = os.environ["SUPABASE_URL"]
-    SUPABASE_KEY: str = os.environ["SUPABASE_KEY"]
+    SUPABASE_URL: str
+    SUPABASE_KEY: str
 
-    LLM_API_BASE: str = os.environ["LLM_API_BASE"].rstrip("/")
-    LLM_API_KEY: str = os.environ["LLM_API_KEY"]
-    LLM_MODEL: str = os.environ.get("LLM_MODEL", "deepseek-v4")
+    LLM_API_BASE: str
+    LLM_API_KEY: str
+    LLM_MODEL: str = "deepseek-v4"
 
-    HISTORY_LIMIT: int = int(os.environ.get("HISTORY_LIMIT", 10))
+    HISTORY_LIMIT: int = 10
+    HISTORY_CHAR_BUDGET: int = 6000  # rough cap on history text sent per request
+    LLM_TIMEOUT_SECONDS: float = 30.0
+    LLM_MAX_RETRIES: int = 2
+
+    PORT: int = 8080
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @property
+    def webhook_url(self) -> str:
+        return self.WEBHOOK_URL.rstrip("/")
+
+    @property
+    def llm_api_base(self) -> str:
+        return self.LLM_API_BASE.rstrip("/")
 
 
-config = Config()
+try:
+    config = Settings()
+except Exception as exc:  # pragma: no cover
+    raise SystemExit(
+        f"Missing or invalid environment configuration: {exc}\n"
+        "Check that BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET, SUPABASE_URL, "
+        "SUPABASE_KEY, LLM_API_BASE, LLM_API_KEY are all set."
+    )

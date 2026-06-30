@@ -1,10 +1,11 @@
+import asyncio
 import logging
-from typing import Optional
+from typing import List, Dict, Optional
 
 import httpx
 
 from bot.config import config
-from bot.db import fetch_history, save_history
+from bot.db import fetch_history, save_history, HistoryTurn
 
 logger = logging.getLogger("neura.ai")
 
@@ -39,33 +40,91 @@ TONE
 
 FALLBACK_REPLY = "Sorry, I'm having trouble responding right now. Try again in a moment."
 
+# Single pooled client shared across all requests — created/closed by main.py's
+# lifespan handler. Reusing one client keeps TCP/TLS connections warm instead
+# of paying a new handshake on every single message.
+_http_client: Optional[httpx.AsyncClient] = None
 
-async def generate_ai_reply(user_id: int, group_id: int, text: str) -> str:
-    history = await fetch_history(user_id, group_id)
 
+def init_http_client() -> None:
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(config.LLM_TIMEOUT_SECONDS, connect=10.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    )
+
+
+async def close_http_client() -> None:
+    if _http_client is not None:
+        await _http_client.aclose()
+
+
+def _trim_history_to_budget(history: List[HistoryTurn], char_budget: int) -> List[HistoryTurn]:
+    """Keep the most recent turns that fit within char_budget, dropping the oldest first."""
+    kept: List[HistoryTurn] = []
+    used = 0
+    for turn in reversed(history):
+        cost = len(turn["message"])
+        if used + cost > char_budget and kept:
+            break
+        kept.append(turn)
+        used += cost
+    kept.reverse()
+    return kept
+
+
+def _build_messages(history: List[HistoryTurn], text: str) -> List[Dict]:
+    trimmed = _trim_history_to_budget(history, config.HISTORY_CHAR_BUDGET)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for turn in history:
-        messages.append({"role": turn["role"], "content": turn["message"]})
+    messages.extend({"role": t["role"], "content": t["message"]} for t in trimmed)
     messages.append({"role": "user", "content": text})
+    return messages
 
-    reply: Optional[str] = None
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{config.LLM_API_BASE}/chat/completions",
+
+async def _call_llm(messages: List[Dict]) -> str:
+    if _http_client is None:
+        raise RuntimeError("HTTP client not initialized — call init_http_client() at startup")
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(config.LLM_MAX_RETRIES + 1):
+        try:
+            resp = await _http_client.post(
+                f"{config.llm_api_base}/chat/completions",
                 headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
-                json={
-                    "model": config.LLM_MODEL,
-                    "messages": messages,
-                },
+                json={"model": config.LLM_MODEL, "messages": messages},
             )
             resp.raise_for_status()
             data = resp.json()
-            reply = data["choices"][0]["message"]["content"]
+            return data["choices"][0]["message"]["content"]
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            wait = 0.5 * (2 ** attempt)
+            logger.warning("LLM call attempt %d failed (%s), retrying in %.1fs", attempt + 1, exc, wait)
+            await asyncio.sleep(wait)
+        except httpx.HTTPStatusError as exc:
+            # Don't retry on 4xx (bad request/auth) — only on 5xx
+            if 500 <= exc.response.status_code < 600 and attempt < config.LLM_MAX_RETRIES:
+                last_exc = exc
+                wait = 0.5 * (2 ** attempt)
+                logger.warning("LLM 5xx (%s), retrying in %.1fs", exc.response.status_code, wait)
+                await asyncio.sleep(wait)
+                continue
+            raise
+
+    raise last_exc or RuntimeError("LLM call failed with no exception captured")
+
+
+async def generate_ai_reply(user_id: int, group_id: int, text: str) -> str:
+    history = await fetch_history(user_id, group_id)
+    messages = _build_messages(history, text)
+
+    try:
+        reply = await _call_llm(messages)
     except Exception:
-        logger.exception("LLM call failed for user_id=%s group_id=%s", user_id, group_id)
+        logger.exception("LLM call failed user_id=%s group_id=%s", user_id, group_id)
         return FALLBACK_REPLY
 
+    # Fire-and-forget-ish but awaited so failures are logged, not silently lost
     await save_history(user_id, group_id, "user", text)
     await save_history(user_id, group_id, "assistant", reply)
 
@@ -82,18 +141,7 @@ async def generate_inline_reply(user_id: int, text: str) -> str:
         {"role": "user", "content": text},
     ]
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                f"{config.LLM_API_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
-                json={
-                    "model": config.LLM_MODEL,
-                    "messages": messages,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+        return await _call_llm(messages)
     except Exception:
-        logger.exception("Inline LLM call failed for user_id=%s", user_id)
+        logger.exception("Inline LLM call failed user_id=%s", user_id)
         return FALLBACK_REPLY
